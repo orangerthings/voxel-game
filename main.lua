@@ -11,8 +11,8 @@ local channel_out = lovr.thread.getChannel("chunk_loader_out")
 function lovr.load()
     local chunk_loader = lovr.thread.newThread("chunk_loader.lua")
     chunk_loader:start()
-    for bx = -5, 5 do
-        for bz = -5, 5 do
+    for bx = -0, 0 do
+        for bz = -0, 0 do
             local to_load = {}
             for x = 0, 15 do
                 for y = -1, 1 do
@@ -83,3 +83,4 @@ function lovr.draw(pass)
     end
     pass:text("Hello World!")
 end
+
