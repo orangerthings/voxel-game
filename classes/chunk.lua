@@ -6,7 +6,7 @@ ffi.cdef [[
 	typedef struct { uint16_t tile; } block;
 ]]
 
-local chunkSize = 16
+local chunkSize = 32
 
 local BlockRegistry = require("registry.block")
 
@@ -35,8 +35,21 @@ function Chunk:new(cx, cy, cz, space)
     return self
 end
 
+function Chunk:delete()
+    if self.mesh then
+        self.mesh:release()
+        self.mesh = nil
+    end
+    self.blob:release()
+    self.blocks = nil
+end
+
 function Chunk:onRestore()
     self.blocks = ffi.cast("block*", self.blob:getPointer())
+end
+
+function Chunk:getKey()
+    return self.cx..","..self.cy..","..self.cz
 end
 
 function Chunk:outOfBounds(x, y, z)
@@ -57,7 +70,7 @@ function Chunk:getTileId(x, y, z)
     if id then
         return self.blocks[id].tile
     else
-        return self.space and self.space:getTile(x + self.cx * 16, y + self.cy * 16, z + self.cz * 16) or 0
+        return self.space and self.space:getTile(x + self.cx * chunkSize, y + self.cy * chunkSize, z + self.cz * chunkSize) or 0
     end
 end
 
@@ -77,7 +90,7 @@ function Chunk:generate()
     for x = 1, chunkSize do
         for y = 1, chunkSize do
             for z = 1, chunkSize do
-                local wx, wy, wz = x+self.cx*16, y+self.cy*16, z+self.cz*16
+                local wx, wy, wz = x+self.cx*32, y+self.cy*32, z+self.cz*32
                 local height = lovr.math.noise(wx/16, wz/16)*8
                 if wy <= height then
                     if wy < 3 then
@@ -304,8 +317,14 @@ function Chunk:buildMesh()
         self.mesh = nil
         return
     end
-    self.mesh = lovr.graphics.newMesh({{"VertexPosition", "vec3"},{"VertexUV", "vec2"},{"VertexTile", "float"}}, self.built.vertices, "cpu")
+    if self.mesh then
+        self.mesh:release()
+        self.mesh = nil
+    end
+    self.mesh = lovr.graphics.newMesh({{"VertexPosition", "vec3"},{"VertexUV", "vec2"},{"VertexTile", "float"}}, self.built.vertices, "gpu")
     self.mesh:setIndices(self.built.indices)
+    self.built.indices = {}
+    self.built.vertices = {}
 end
 
 function Chunk:updateMesh()

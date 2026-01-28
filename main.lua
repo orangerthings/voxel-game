@@ -6,51 +6,97 @@ require('load')
 local World = require('classes.world')
 local world = World()
 
+local renderDistance = 16
+local requested = {}
 local channel_in = lovr.thread.getChannel("chunk_loader_in")
 local channel_out = lovr.thread.getChannel("chunk_loader_out")
 function lovr.load()
     local chunk_loader = lovr.thread.newThread("chunk_loader.lua")
     chunk_loader:start()
-    for bx = -0, 0 do
-        for bz = -0, 0 do
-            local to_load = {}
-            for x = 0, 15 do
-                for y = -1, 1 do
-                    for z = 0, 15 do
-                        table.insert(to_load, {cx = 16*bx + x, cy = y, cz = 16*bz + z})
-                    end
-                end
-            end
-            local label = string.format("Loaded chunk batch at bx=%d bz=%d", bx, bz)
-            Debug.timerStart(label)
-            channel_in:push(Data.createMessage("batch", to_load, label))
-        end
-    end
 end
 -- Receive and update chunks
+local pcx, pcy, pcz = 0, 0, 10
 function lovr.update(dt)
+    local x, y, z = lovr.headset.getPosition()
+    local cx, cy, cz = World:positionToChunkCoords(x, y, z)
+
     local message = channel_out:pop()
     if message then
         local mtype, payload, name = Data.readMessage(message)
         if mtype == "create" then
-            world:addChunk(payload)
-            payload:buildMesh()
-        end
-        if mtype == "update" then
-            for k, chunk in ipairs(world.chunks) do
-                if chunk.cx == payload.cx and chunk.cy == payload.cy and chunk.cz == payload.cz then
-                    world.chunks[k] = payload
-                    break
-                end
-            end
-            payload:buildMesh()
-        end
-        if mtype == "batch" then
-            for _, chunk in pairs(payload) do
+            local chunk = payload
+            if (chunk.cx - cx)^2 + (chunk.cy - cy)^2 + (chunk.cz - cz)^2 <= renderDistance^2 then
                 world:addChunk(chunk)
                 chunk:buildMesh()
             end
-            Debug.timerStop(name)
+            requested[chunk:getKey()] = nil
+        end
+        if mtype == "update" then
+            local chunk = payload
+            if (chunk.cx - cx)^2 + (chunk.cy - cy)^2 + (chunk.cz - cz)^2 <= renderDistance^2 then
+                world.chunks[chunk:getKey()] = chunk
+                chunk:buildMesh()
+            end
+        end
+        if mtype == "batch" then
+            for k, chunk in pairs(payload) do
+                if (chunk.cx - cx)^2 + (chunk.cy - cy)^2 + (chunk.cz - cz)^2 <= renderDistance^2 then
+                    world:addChunk(chunk)
+                    chunk:buildMesh()
+                end
+                requested[k] = nil
+            end
+        end
+        if mtype == "batch_update" then
+            for k, chunk in pairs(payload) do
+                if (chunk.cx - cx)^2 + (chunk.cy - cy)^2 + (chunk.cz - cz)^2 <= renderDistance^2 then
+                    world.chunks[chunk:getKey()] = chunk
+                    chunk:buildMesh()
+                end
+                requested[k] = nil
+            end
+        end
+    end
+
+    local to_update = {}
+    for _, chunk in ipairs(world.unorderedChunks) do
+        if (chunk.cx - cx)^2 + (chunk.cy - cy)^2 + (chunk.cz - cz)^2 <= renderDistance^2 then
+            if chunk.dirty then
+                requested[chunk:getKey()] = true
+                table.insert(to_update, chunk)
+            end
+        end
+    end
+    if #to_update > 0 then
+        channel_in:push(Data.createMessage("batch_update", to_update, "Chunk Update"))
+        to_update = nil
+    end
+
+    local to_load = {}
+    if pcx ~= cx or pcy ~= cy or pcz ~= cz then
+        pcx, pcy, pcz = cx, cy, cz
+        for _, chunk in ipairs(world.unorderedChunks) do
+            if (chunk.cx - cx)^2 + (chunk.cy - cy)^2 + (chunk.cz - cz)^2 > renderDistance^2 then
+                world:removeChunk(chunk.cx, chunk.cy, chunk.cz)
+            end
+        end
+        for dx = -renderDistance, renderDistance do
+            for dy = -1, 1 do
+                for dz = -renderDistance, renderDistance do
+                    if dx^2 + dy^2 + dz^2 <= renderDistance^2 then
+                        local ncx, ncy, ncz = cx + dx, dy, cz + dz
+                        local key = world:chunkKeyFromCoords(ncx, ncy, ncz)
+                        if not world:getChunk(ncx, ncy, ncz) and not requested[key] then
+                            requested[key] = true
+                            table.insert(to_load, {cx = ncx, cy = ncy, cz = ncz})
+                        end
+                    end
+                end
+            end
+        end
+        if #to_load > 0 then
+            channel_in:push(Data.createMessage("batch", to_load, "Chunk Load"))
+            to_load = nil
         end
     end
 end
@@ -63,7 +109,7 @@ for id, block in ipairs(BlockRegistry.byId) do
     local texturePath = "textures/"..block.texture..".png"
     images[id] = texturePath
 end
-local array = lovr.graphics.newTexture(images, {mipmaps=true,usage={"sample"},format="rgb565",type="array"})
+local array = lovr.graphics.newTexture(images, {mipmaps=true,usage={"sample"},format="rgba8",type="array"})
 -- Shader
 local shader = lovr.graphics.newShader("shaders/tiled.vert", "shaders/tiled.frag")
 -- Draw
@@ -74,13 +120,12 @@ function lovr.draw(pass)
     pass:setShader(shader)
     pass:send("textureArray", array)
 
-    for _, chunk in pairs(world.chunks) do
+    for _, chunk in ipairs(world.unorderedChunks) do
         pass:origin()
-        pass:translate(chunk.cx * 16, chunk.cy * 16, chunk.cz * 16)
+        pass:translate(chunk.cx * 32, chunk.cy * 32, chunk.cz * 32)
         if chunk.mesh then
             pass:draw(chunk.mesh)
         end
     end
     pass:text("Hello World!")
 end
-

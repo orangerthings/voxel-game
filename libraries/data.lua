@@ -21,6 +21,55 @@ local blacklisted = {
 -- 3. remove all unsupported data types
 function Data.internTable(absolved)
     local interned = {}
+    local visited = {}
+
+    local function getId(t)
+        if t == absolved then
+            return "_master"
+        end
+        return string.format("table: %p", t)
+    end
+
+    local function intern(t)
+        if visited[t] then
+            return
+        end
+        visited[t] = true
+        local id = getId(t)
+        local clone = {}
+        -- store metatable or class name
+        local mt = getmetatable(t)
+        if mt then
+            if mt.className then
+                clone._className = mt.className
+            else
+                clone._meta = mt
+            end
+        end
+        interned[id] = clone
+        Data.iterateVisible(t, function(k, v)
+            -- skip unsupported types
+            if blacklisted[type(v)] then
+                return
+            end
+            if type(v) == "table" then
+                local vid = getId(v)
+                clone[k] = { _interned = true, id = vid }
+                intern(v)
+            else
+                clone[k] = v
+            end
+        end)
+    end
+
+    intern(absolved)
+
+    return interned
+end
+
+-- the old legacy version that mutated the input table
+function Data.internTableLegacy(absolved)
+    local interned = {}
 
     local function addToInterned(t, id)
         if t == absolved then
@@ -78,7 +127,6 @@ local classes = {}
 function Data.absolveTable(interned)
     local function absolve(t)
         if not t._ignore then
-            t._visited = nil
             Data.iterateVisible(t, function(k, v)
                 -- restore table
                 if type(v) == "table" then
@@ -108,7 +156,7 @@ function Data.absolveTable(interned)
                 end
                 setmetatable(t, class)
                 if type(t.onRestore) == "function" then
-                    t:onRestore()
+                    t:onRestore()   
                 end
                 t._className = nil
             end
@@ -123,11 +171,12 @@ end
 
 -- time for messages
 
-Data.createMessage = function(type, payload, name)
+Data.createMessage = function(type, payload, name, intern)
+    intern = intern or true
     local debugLabel = string.format("Message type %s created", type)
     Debug.timerStart(debugLabel)
 
-    local payload = Data.internTable(payload)
+    payload = Data.internTable(payload)
 
     Debug.timerStop(debugLabel)
     return {
@@ -137,7 +186,8 @@ Data.createMessage = function(type, payload, name)
     }
 end
 
-Data.readMessage = function(message)
+Data.readMessage = function(message, absolve)
+    absolve = absolve or true
     local debugLabel = string.format("Message type %s read", message.type)
     Debug.timerStart(debugLabel)
 

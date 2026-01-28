@@ -5,6 +5,7 @@ lovr.data = require 'lovr.data'
 lovr.timer = require 'lovr.timer'
 lovr.thread = require 'lovr.thread'
 lovr.math = require 'lovr.math'
+lovr.graphics = require 'lovr.graphics'
 
 -- Reregister every single module needed again
 require('content.load')
@@ -38,6 +39,18 @@ while true do
                 chunk:generateMesh()
             end
             channel_out:push(Data.createMessage("batch", chunkspace.chunks, message.name))
+            chunkspace:delete()
+            chunkspace = nil
+        end
+        if mtype == "batch_update" then
+            local chunkspace = ChunkSpace()
+            for _, chunk in ipairs(payload) do
+                chunkspace:addChunk(chunk)
+            end
+            for _, chunk in pairs(chunkspace.chunks) do
+                chunk:updateMesh()
+            end
+            channel_out:push(Data.createMessage("batch_update", chunkspace.chunks, message.name))
         end
     end
 end

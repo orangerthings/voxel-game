@@ -7,4 +7,3 @@ function World:new()
 end
 
 return World
-
