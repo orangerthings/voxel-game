@@ -3,102 +3,48 @@ local Debug = require('libraries.debug')
 local BlockRegistry = require("registry.block")
 require('load')
 
-local World = require('classes.world')
-local world = World()
+local Chunk = require('classes.chunk')
+
+local world = Chunk.space
 
 local renderDistance = 16
-local requested = {}
-local channel_in = lovr.thread.getChannel("chunk_loader_in")
-local channel_out = lovr.thread.getChannel("chunk_loader_out")
-function lovr.load()
-    local chunk_loader = lovr.thread.newThread("chunk_loader.lua")
-    chunk_loader:start()
-end
+local rd2 = renderDistance * renderDistance
+
 -- Receive and update chunks
 local pcx, pcy, pcz = 0, 0, 10
 function lovr.update(dt)
-    local x, y, z = lovr.headset.getPosition()
-    local cx, cy, cz = World:positionToChunkCoords(x, y, z)
+    local cx, cy, cz = world:positionToChunkCoords(lovr.headset.getPosition())
 
-    local message = channel_out:pop()
-    if message then
-        local mtype, payload, name = Data.readMessage(message)
-        if mtype == "create" then
-            local chunk = payload
-            if (chunk.cx - cx)^2 + (chunk.cy - cy)^2 + (chunk.cz - cz)^2 <= renderDistance^2 then
-                world:addChunk(chunk)
-                chunk:buildMesh()
-            end
-            requested[chunk:getKey()] = nil
-        end
-        if mtype == "update" then
-            local chunk = payload
-            if (chunk.cx - cx)^2 + (chunk.cy - cy)^2 + (chunk.cz - cz)^2 <= renderDistance^2 then
-                world.chunks[chunk:getKey()] = chunk
-                chunk:buildMesh()
-            end
-        end
-        if mtype == "batch" then
-            for k, chunk in pairs(payload) do
-                if (chunk.cx - cx)^2 + (chunk.cy - cy)^2 + (chunk.cz - cz)^2 <= renderDistance^2 then
-                    world:addChunk(chunk)
-                    chunk:buildMesh()
-                end
-                requested[k] = nil
-            end
-        end
-        if mtype == "batch_update" then
-            for k, chunk in pairs(payload) do
-                if (chunk.cx - cx)^2 + (chunk.cy - cy)^2 + (chunk.cz - cz)^2 <= renderDistance^2 then
-                    world.chunks[chunk:getKey()] = chunk
-                    chunk:buildMesh()
-                end
-                requested[k] = nil
-            end
-        end
-    end
-
-    local to_update = {}
-    for _, chunk in ipairs(world.unorderedChunks) do
-        if (chunk.cx - cx)^2 + (chunk.cy - cy)^2 + (chunk.cz - cz)^2 <= renderDistance^2 then
-            if chunk.dirty then
-                requested[chunk:getKey()] = true
-                table.insert(to_update, chunk)
-            end
-        end
-    end
-    if #to_update > 0 then
-        channel_in:push(Data.createMessage("batch_update", to_update, "Chunk Update"))
-        to_update = nil
-    end
-
-    local to_load = {}
-    if pcx ~= cx or pcy ~= cy or pcz ~= cz then
+    if cx ~= pcx or cy ~= pcy or cz ~= pcz then
         pcx, pcy, pcz = cx, cy, cz
-        for _, chunk in ipairs(world.unorderedChunks) do
-            if (chunk.cx - cx)^2 + (chunk.cy - cy)^2 + (chunk.cz - cz)^2 > renderDistance^2 then
+        -- unload chunks outside render distance
+        for _, chunk in pairs(world.chunks) do
+            local dx, dy, dz = chunk.cx - cx, chunk.cy - cy, chunk.cz - cz
+            if dx * dx + dy * dy + dz * dz > rd2 then
                 world:removeChunk(chunk.cx, chunk.cy, chunk.cz)
             end
         end
-        for dx = -renderDistance, renderDistance do
-            for dy = -1, 1 do
-                for dz = -renderDistance, renderDistance do
-                    if dx^2 + dy^2 + dz^2 <= renderDistance^2 then
-                        local ncx, ncy, ncz = cx + dx, dy, cz + dz
-                        local key = world:chunkKeyFromCoords(ncx, ncy, ncz)
-                        if not world:getChunk(ncx, ncy, ncz) and not requested[key] then
-                            requested[key] = true
-                            table.insert(to_load, {cx = ncx, cy = ncy, cz = ncz})
+
+        -- load/update chunks within render distance
+        local to_create = {}
+        for lx = cx - renderDistance, cx + renderDistance do
+            for ly = cy - 1, cy + 1 do
+                for lz = cz - renderDistance, cz + renderDistance do
+                    local dx, dy, dz = lx - cx, ly - cy, lz - cz
+                    if dx * dx + dy * dy + dz * dz <= rd2 then
+                        local chunk = world:getChunk(lx, ly, lz)
+                        if not chunk then
+                            table.insert(to_create, {cx = lx, cy = ly, cz = lz})
+                        elseif chunk.dirty then
+                            table.insert(to_create, {cx = lx, cy = ly, cz = lz, blob = chunk.blob})
                         end
                     end
                 end
             end
         end
-        if #to_load > 0 then
-            channel_in:push(Data.createMessage("batch", to_load, "Chunk Load"))
-            to_load = nil
-        end
+        Chunk.generateMany(to_create)
     end
+    Chunk.lovrUpdate()
 end
 
 -- Sampler

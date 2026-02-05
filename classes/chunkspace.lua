@@ -1,6 +1,7 @@
 local Object = require("libraries.classic")
 ChunkSpace = Object:extend("ChunkSpace")
 
+-- a sp ace of chunks
 function ChunkSpace:new()
     self.chunks = {}
     self.unorderedChunks = {}
@@ -57,17 +58,21 @@ function ChunkSpace:positionToLocalCoords(x, y, z)
 end
 
 function ChunkSpace:getTile(x, y, z)
-    local chunk = self:getChunk(self:positionToChunkCoords(x, y, z))
+    local cx, cy, cz = self:positionToChunkCoords(x, y, z)
+    local chunk = self:getChunk(cx, cy, cz)
     if chunk then
-        return chunk:getTileId(self:positionToLocalCoords(x, y, z))
+        local lx, ly, lz = self:positionToLocalCoords(x, y, z)
+        return chunk:getTileId(lx, ly, lz)
     end
     return nil
 end
 
 function ChunkSpace:setTile(x, y, z, tile)
-    local chunk = self:getChunk(self:positionToChunkCoords(x, y, z))
+    local cx, cy, cz = self:positionToChunkCoords(x, y, z)
+    local chunk = self:getChunk(cx, cy, cz)
     if chunk then
-        chunk:setTileId(self:positionToLocalCoords(x, y, z), tile)
+        local lx, ly, lz = self:positionToLocalCoords(x, y, z)
+        chunk:setTileId(lx, ly, lz, tile)
     end
 end
 
