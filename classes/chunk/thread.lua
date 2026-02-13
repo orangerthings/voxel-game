@@ -253,6 +253,17 @@ local function generateVerticesAndIndices(cx, cy, cz, pointer, space)
     return vertices, indices
 end
 
+local function buildMesh(vertices, indices)
+    --this part will build the mesh and send it back
+    -- if there are no indices, dont create a mesh
+    if #indices == 0 then
+        return nil
+    end
+    local mesh = lovr.graphics.newMesh({{"VertexPosition", "vec3"},{"VertexUV", "vec2"},{"VertexTile", "float"}}, vertices, "gpu")
+    mesh:setIndices(indices)
+    return mesh
+end
+
 local funcs = {
     generate = generate,
     generateVerticesAndIndices = generateVerticesAndIndices,
@@ -271,6 +282,7 @@ local funcs = {
         end
         for _, p in pairs(to_send.chunks) do
             p.vertices, p.indices = generateVerticesAndIndices(p.cx, p.cy, p.cz, p.blocks, to_send)
+            p.mesh = buildMesh(p.vertices, p.indices)
             print("Generated mesh for chunk at ", p.cx, p.cy, p.cz, #p.vertices, #p.indices)
         end
         for _, p in pairs(to_send.chunks) do

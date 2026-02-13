@@ -7,7 +7,7 @@ local Chunk = require('classes.chunk')
 
 local world = Chunk.space
 
-local renderDistance = 16
+local renderDistance = 4
 local rd2 = renderDistance * renderDistance
 
 -- Receive and update chunks
@@ -28,7 +28,7 @@ function lovr.update(dt)
         -- load/update chunks within render distance
         local to_create = {}
         for lx = cx - renderDistance, cx + renderDistance do
-            for ly = cy - 1, cy + 1 do
+            for ly = -1, 1 do
                 for lz = cz - renderDistance, cz + renderDistance do
                     local dx, dy, dz = lx - cx, ly - cy, lz - cz
                     if dx * dx + dy * dy + dz * dz <= rd2 then
@@ -42,7 +42,7 @@ function lovr.update(dt)
                 end
             end
         end
-        Chunk.generateMany(to_create)
+        Chunk.makeMany(to_create)
     end
     Chunk.lovrUpdate()
 end

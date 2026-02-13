@@ -8,8 +8,6 @@ ffi.cdef [[
 
 local chunkSize = Primitive.chunkSize
 
-local channel_in = lovr.thread.getChannel("chunk_thread_in")
-local channel_out = lovr.thread.getChannel("chunk_thread_out")
 local chunk_loader = lovr.thread.newThread("classes/chunk/thread.lua")
 chunk_loader:start()
 
@@ -24,7 +22,6 @@ function Chunk:new(cx, cy, cz)
 
     self.space = Chunk.space
     self.space:addChunk(self)
-    self.mesh = nil
 
     self.generated = false
     self.dirty = false
@@ -80,14 +77,21 @@ function Chunk:setTileId(x, y, z, tile)
     end
 end
 
+local channel_in = lovr.thread.getChannel("chunk_thread_in")
+local channel_out = lovr.thread.getChannel("chunk_thread_out")
 -- each to_create has cx, cy, cz, and optionally, blob.
 -- if blob not provided: generate terrain (to create blob) AND give a mesh (so like generate)
 -- if blob is provided: just give a mesh (so like update)
-function Chunk.generateMany(to_create)
+function Chunk.makeMany(to_create)
     for _, r in ipairs(to_create) do
         Chunk.space:addChunk(Chunk(r.cx, r.cy, r.cz))
     end
     channel_in:push({func = "createChunkPrimitives", args = {to_create}})
+end
+
+function Chunk.makeOne(r)
+    Chunk.space:addChunk(Chunk(r.cx, r.cy, r.cz))
+    channel_in:push({func = "createChunkPrimitives", args = {{r}}})
 end
 
 -- runs everry lovr.update
@@ -103,8 +107,8 @@ function Chunk.lovrUpdate()
                     chunk.blob = primitive.blob
                     chunk.blocks = ffi.cast("block*", chunk.blob:getPointer())
                 end
+                chunk.mesh = primitive.mesh
                 chunk.generated = true
-                chunk:buildMesh(primitive.vertices, primitive.indices)
             end
         end
 
@@ -118,7 +122,7 @@ end
 function Chunk:buildMesh(vertices, indices)
     --this part will build the mesh and send it back
     -- if there are no indices, dont create a mesh
-    if #indices == 0 or #vertices == 0 then
+    if #indices == 0 then
         self.mesh = nil
         return
     end

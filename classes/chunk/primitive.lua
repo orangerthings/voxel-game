@@ -11,6 +11,7 @@ function Primitive:new(cx, cy, cz)
     self.cz = cz
     self.blocks = nil
     self.blob = nil
+    self.mesh = nil
     self.vertices = nil
     self.indices = nil
 end
