@@ -4,7 +4,6 @@ ChunkSpace = Object:extend("ChunkSpace")
 -- a sp ace of chunks
 function ChunkSpace:new()
     self.chunks = {}
-    self.unorderedChunks = {}
 end
 
 function ChunkSpace:delete()
@@ -12,7 +11,6 @@ function ChunkSpace:delete()
         chunk:delete()
     end
     self.chunks = {}
-    self.unorderedChunks = {}
 end
 
 function ChunkSpace:chunkKeyFromCoords(x, y, z)
@@ -27,18 +25,12 @@ end
 function ChunkSpace:addChunk(chunk)
     local key = self:chunkKeyFromCoords(chunk.cx, chunk.cy, chunk.cz)
     self.chunks[key] = chunk
-    table.insert(self.unorderedChunks, chunk)
     chunk.space = self
 end
 
 function ChunkSpace:removeChunk(x, y, z)
     local key = self:chunkKeyFromCoords(x, y, z)
-    for i, chunk in ipairs(self.unorderedChunks) do
-        if chunk.cx == x and chunk.cy == y and chunk.cz == z then
-            table.remove(self.unorderedChunks, i)
-            break
-        end
-    end
+    if not self.chunks[key] then return end
     self.chunks[key]:delete()
     self.chunks[key] = nil
 end

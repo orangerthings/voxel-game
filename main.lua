@@ -3,48 +3,56 @@ local Debug = require('libraries.debug')
 local BlockRegistry = require("registry.block")
 require('load')
 
-local Chunk = require('classes.chunk')
+local World = require('classes.world')
+local world = World()
 
-local world = Chunk.space
-
-local renderDistance = 4
+local renderDistance = 16
 local rd2 = renderDistance * renderDistance
+
+local testlod = 1
 
 -- Receive and update chunks
 local pcx, pcy, pcz = 0, 0, 10
 function lovr.update(dt)
     local cx, cy, cz = world:positionToChunkCoords(lovr.headset.getPosition())
-
     if cx ~= pcx or cy ~= pcy or cz ~= pcz then
         pcx, pcy, pcz = cx, cy, cz
         -- unload chunks outside render distance
+        local to_remove = {}
         for _, chunk in pairs(world.chunks) do
             local dx, dy, dz = chunk.cx - cx, chunk.cy - cy, chunk.cz - cz
             if dx * dx + dy * dy + dz * dz > rd2 then
-                world:removeChunk(chunk.cx, chunk.cy, chunk.cz)
+                table.insert(to_remove, {chunk.cx, chunk.cy, chunk.cz})
             end
+        end
+        for _, chunk in ipairs(to_remove) do
+            world:removeChunk(chunk[1], chunk[2], chunk[3])
         end
 
         -- load/update chunks within render distance
-        local to_create = {}
         for lx = cx - renderDistance, cx + renderDistance do
-            for ly = -1, 1 do
+            for ly = -2, 1 do
                 for lz = cz - renderDistance, cz + renderDistance do
                     local dx, dy, dz = lx - cx, ly - cy, lz - cz
                     if dx * dx + dy * dy + dz * dz <= rd2 then
                         local chunk = world:getChunk(lx, ly, lz)
                         if not chunk then
-                            table.insert(to_create, {cx = lx, cy = ly, cz = lz})
-                        elseif chunk.dirty then
-                            table.insert(to_create, {cx = lx, cy = ly, cz = lz, blob = chunk.blob})
+                            world:makeChunk({cx = lx, cy = ly, cz = lz, lod = testlod})
+                        elseif chunk.meshState == 0 and chunk.generateState == 2 then
+                            world:meshChunk({cx = lx, cy = ly, cz = lz, lod = testlod, chunk = chunk})
                         end
                     end
                 end
             end
         end
-        Chunk.makeMany(to_create)
     end
-    Chunk.lovrUpdate()
+    world:lovrUpdateAll()
+end
+
+function lovr.keyreleased(key)
+    if key == "g" then
+        Debug.printAverages()
+    end
 end
 
 -- Sampler
@@ -66,7 +74,7 @@ function lovr.draw(pass)
     pass:setShader(shader)
     pass:send("textureArray", array)
 
-    for _, chunk in ipairs(world.unorderedChunks) do
+    for _, chunk in pairs(world.chunks) do
         pass:origin()
         pass:translate(chunk.cx * 32, chunk.cy * 32, chunk.cz * 32)
         if chunk.mesh then
