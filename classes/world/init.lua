@@ -84,8 +84,12 @@ World.lovrUpdate = {
             if t == 2 then
                 local chunk = self:getChunk(payload.cx, payload.cy, payload.cz)
                 if chunk then
-                    chunk.mesh = payload.mesh
-
+                    local mesh = lovr.graphics.newMesh(
+                        {{"VertexPosition","vec3"},{"VertexUV","vec2"},{"VertexTile","float"}},
+                        payload.vertices, "gpu"
+                    )
+                    mesh:setIndices(payload.indices, "u32")
+                    chunk.mesh = mesh
                     -- set to meshed status
                     chunk.meshState = 2
                 end
@@ -103,8 +107,12 @@ World.lovrUpdate = {
                 if chunk then
                     chunk.blob = payload.blob
                     chunk.blocks = ffi.cast("block*", payload.blob:getPointer())
-                    chunk.mesh = payload.mesh
-
+                    local mesh = lovr.graphics.newMesh(
+                        {{"VertexPosition","vec3"},{"VertexUV","vec2"},{"VertexTile","float"}},
+                        payload.vertices, "gpu"
+                    )
+                    mesh:setIndices(payload.indices, "u32")
+                    chunk.mesh = mesh
                     -- set to generated status
                     chunk.generateState = 2
                     -- set to meshed status

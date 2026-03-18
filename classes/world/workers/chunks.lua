@@ -19,7 +19,6 @@ local chunkSize = 32
 local ffi = require("ffi")
 -- define chunk space c structs for ffi
 ffi.cdef(string.format([[
-
     typedef struct { 
         uint16_t tile;
         uint8_t state;
@@ -75,16 +74,19 @@ local CSpace = ffi.new("ChunkSpace")
 C.init_space(CSpace)
 
 -- stuff to sync chunks on the main thread and worker thread
--- table of references so that the gc doesnt execute the ffi objects while they are still in use by the worker thread
+-- table of references so that the gc doesnt behead the ffi objects while they are still in use by the worker thread
 local references = {}
+
+local C_found = ffi.new("bool[1]") -- reuse
 
 local function C_get_chunk(cx, cy, cz)
     local pos = ffi.new("position", cx, cy, cz)
-    local found = ffi.new("bool[1]")
-    local chunk = C.get_chunk(CSpace, pos, found)
-    if found[0] then
+    local chunk = C.get_chunk(CSpace, pos, C_found)
+    if C_found[0] then
+        C_found[0] = false
         return chunk
     else
+        C_found[0] = false
         return nil
     end
 end
@@ -103,11 +105,11 @@ end
 
 local function C_remove_chunk(cx, cy, cz)
     local pos = ffi.new("position", cx, cy, cz)
-    local found = ffi.new("bool[1]")
-    C.get_chunk(CSpace, pos, found)
-    if found[0] then
+    C.get_chunk(CSpace, pos, C_found)
+    if C_found[0] then
         C.remove_chunk(CSpace, pos)
         references[cx..","..cy..","..cz] = nil  -- release GC reference
+        C_found[0] = false
     end
 end
 
@@ -126,14 +128,14 @@ local vertexBuffer = lovr.data.newBlob(maxQuads * 4 * 6 * 4)
 local indexBuffer  = lovr.data.newBlob(maxQuads * 6 * 4)
 local vertexPointer = ffi.cast("float*", vertexBuffer:getPointer())
 local indexPointer  = ffi.cast("uint32_t*", indexBuffer:getPointer())
+local vertexCount = ffi.new("int[1]")
+local indexCount  = ffi.new("int[1]")
 
 -- generate mesh vertices using greedy meshing
 local function buildMesh(chunk)
     if chunk.neighbors ~= 6 then
         return nil
     end
-    local vertexCount = ffi.new("int[1]")
-    local indexCount  = ffi.new("int[1]")
 
     C.generate_mesh(
         chunk,
@@ -146,16 +148,14 @@ local function buildMesh(chunk)
     )
     if indexCount[0] == 0 then return nil end
 
-    local used = lovr.data.newBlob(indexCount[0] * 4)
-    ffi.copy(used:getPointer(), indexPointer, indexCount[0] * 4)
+    local indices = lovr.data.newBlob(indexCount[0] * 4)
+    ffi.copy(indices:getPointer(), indexPointer, indexCount[0] * 4)
+    local vertices = lovr.data.newBlob(vertexCount[0] * 24)
+    ffi.copy(vertices:getPointer(), vertexPointer, vertexCount[0] * 24)
 
-    local mesh = lovr.graphics.newMesh(
-        {{"VertexPosition","vec3"},{"VertexUV","vec2"},{"VertexTile","float"}},
-        vertexCount[0]
-    )
-    mesh:setVertices(vertexBuffer, 1, vertexCount[0])
-    mesh:setIndices(used, "u32")
-    return mesh
+    vertexCount[0] = 0
+    indexCount[0] = 0
+    return vertices, indices
 end
 
 -- generate blob and blocks
@@ -228,11 +228,12 @@ while true do
         elseif t == 2 then
             local chunk = C_get_chunk(payload.cx, payload.cy, payload.cz)
             if chunk then
-                local mesh = buildMesh(chunk)
-                if mesh then
+                local vertices, indices = buildMesh(chunk)
+                if vertices then
                     channel_worker_out:push({type = 2, payload = {
                         cx = payload.cx, cy = payload.cy, cz = payload.cz,
-                        mesh = mesh
+                        vertices = vertices,
+                        indices = indices
                     }})
                 else
                     channel_worker_out:push({type = 12, payload = { -- failed to mesh
@@ -245,12 +246,13 @@ while true do
             local blob, blocks = generate(payload.cx, payload.cy, payload.cz)
             local chunk = C_new_chunk(payload.cx, payload.cy, payload.cz, payload.lod, blocks)
             C_add_chunk(chunk)
-            local mesh = buildMesh(chunk)
-            if mesh then
+            local vertices, indices = buildMesh(chunk)
+            if vertices then
                 channel_worker_out:push({type = 3, payload = {
                     cx = payload.cx, cy = payload.cy, cz = payload.cz,
                     blob = blob,
-                    mesh = mesh
+                    vertices = vertices,
+                    indices = indices
                 }})
             else
                 channel_worker_out:push({type = 13, payload = { -- failed to mesh

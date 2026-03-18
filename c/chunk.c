@@ -5,6 +5,7 @@
 #include <stdbool.h>
 
 #define CHUNK_SIZE 32
+#define CHUNK_SIZE_M1 31
 #define LOG2_CHUNK_SIZE 5
 
 // important structs
@@ -133,7 +134,7 @@ void add_chunk(ChunkSpace* space, ChunkPrimitive* chunk) {
         }
     }
 
-    if ((double)space->count / space->size >= 0.75) {
+    if ((double)space->count / space->size >= 0.5) {
         resize(space);
     }
 
@@ -220,43 +221,8 @@ void free_space(ChunkSpace* space) {
 }
 
 // methods for manipulating chunk data and stuff now
-static inline bool in_bounds(int8_t x, int8_t y, int8_t z) {
-    return (
-        x >= 0 && x < CHUNK_SIZE &&
-        y >= 0 && y < CHUNK_SIZE &&
-        z >= 0 && z < CHUNK_SIZE
-    );
-}
-
 static inline uint16_t get_block_id(int8_t x, int8_t y, int8_t z) {
-    return (x<<LOG2_CHUNK_SIZE*2) | (y<<LOG2_CHUNK_SIZE) | z;
-}
-
-static inline position get_world_pos(int8_t x, int8_t y, int8_t z, position chunk_pos) {
-    const position pos = {
-        .x = chunk_pos.x*CHUNK_SIZE+x,
-        .y = chunk_pos.y*CHUNK_SIZE+y,
-        .z = chunk_pos.z*CHUNK_SIZE+z
-    };
-    return pos;
-}
-
-static inline int floor_div(int a, int b) {
-    return a / b - (a % b != 0 && (a ^ b) < 0);
-}
-
-static inline int floor_mod(int a, int b) {
-    int r = a % b;
-    return r + (r != 0 && (r ^ b) < 0 ? b : 0);
-}
-
-static inline position get_chunk_pos(position world_pos) {
-    const position pos = {
-        .x = floor_div(world_pos.x, CHUNK_SIZE),
-        .y = floor_div(world_pos.y, CHUNK_SIZE),
-        .z = floor_div(world_pos.z, CHUNK_SIZE)
-    };
-    return pos;
+    return ((uint16_t)x<<LOG2_CHUNK_SIZE*2) | (y<<LOG2_CHUNK_SIZE) | z;
 }
 
 const block AIR = {
@@ -264,23 +230,6 @@ const block AIR = {
     .state = 0,
     .mask = 0
 };
-
-static inline block get_block(
-    int x, int y, int z, int dir,
-    ChunkPrimitive* chunk, ChunkPrimitive** neighbors
-) {
-    if (in_bounds(x, y, z)) {
-        return chunk->blocks[get_block_id(x, y, z)];
-    }
-    ChunkPrimitive* neighbor = neighbors[dir];
-    if (!neighbor) {
-        return AIR;
-    }
-    int8_t lx = (int8_t)floor_mod(x, CHUNK_SIZE);
-    int8_t ly = (int8_t)floor_mod(y, CHUNK_SIZE);
-    int8_t lz = (int8_t)floor_mod(z, CHUNK_SIZE);
-    return neighbor->blocks[get_block_id(lx, ly, lz)];
-}
 
 // meshing
 
@@ -292,6 +241,16 @@ const float QUADS[6][4][5] = {
     {{1,0,1,0,1},{1,0,0,1,1},{1,1,0,1,0},{1,1,1,0,0}},
     {{0,1,1,0,1},{1,1,1,1,1},{1,1,0,1,0},{0,1,0,0,0}},
     {{0,0,1,0,1},{1,0,1,1,1},{1,1,1,1,0},{0,1,1,0,0}}
+};
+
+// for offsetting an id quickly without having to use a special function
+const int offsets[6] = {
+    -(1 << (LOG2_CHUNK_SIZE * 2)),  // -x
+    -(1 << LOG2_CHUNK_SIZE),        // -y
+    -1,                             // -z
+    1 << (LOG2_CHUNK_SIZE * 2),     // +x
+    1 << LOG2_CHUNK_SIZE,           // +y
+    1                               // +z
 };
 
 __declspec(dllexport)
@@ -315,36 +274,56 @@ void compute_mask(
     }
 
     uint8_t lod = chunk->lod;
-
-    for (int x = 0; x < CHUNK_SIZE; x+=lod) {
-        for (int y = 0; y < CHUNK_SIZE; y+=lod) {
-            for (int z = 0; z < CHUNK_SIZE; z+=lod) {
-                uint16_t tile = chunk->blocks[get_block_id(x, y, z)].tile;
+    block* blocks = chunk->blocks;
+    for (int x = 0; x < CHUNK_SIZE; x += lod) {
+        for (int y = 0; y < CHUNK_SIZE; y += lod) {
+            for (int z = 0; z < CHUNK_SIZE; z += lod) {
+                int id = (x << (LOG2_CHUNK_SIZE*2)) | (y << LOG2_CHUNK_SIZE) | z;
+                uint16_t tile = blocks[id].tile;
                 if (tile == 0) {
-                    chunk->blocks[get_block_id(x, y, z)].mask = 0;
+                    blocks[id].mask = 0;
                     continue;
                 }
-                bool is_solid = !transparent[tile];
                 uint8_t mask = 0;
+                bool solid = !transparent[tile];
                 for (int dir = 0; dir < 6; dir++) {
-                    int nx = x + NORMALS[dir][0] * lod;
-                    int ny = y + NORMALS[dir][1] * lod;
-                    int nz = z + NORMALS[dir][2] * lod;
-                    
-                    uint16_t neighbor = get_block(nx, ny, nz, dir, chunk, neighbors).tile;
-                    bool is_solid_neighbor = neighbor != 0 && !transparent[neighbor];
-                    bool shouldDraw = (is_solid && !is_solid_neighbor) || (!is_solid && neighbor == 0);
-                    if (shouldDraw) {
-                        mask |= (1 << dir);
+                    uint16_t neighbor = 0;
+                    if (
+                        x < lod || x >= CHUNK_SIZE-lod ||
+                        y < lod || y >= CHUNK_SIZE-lod ||
+                        z < lod || z >= CHUNK_SIZE-lod // check to see if on border or not
+                    ) {
+                        int nx = x + NORMALS[dir][0]*lod;
+                        int ny = y + NORMALS[dir][1]*lod;
+                        int nz = z + NORMALS[dir][2]*lod;
+                        if (
+                            nx >= 0 && nx < CHUNK_SIZE &&
+                            ny >= 0 && ny < CHUNK_SIZE &&
+                            nz >= 0 && nz < CHUNK_SIZE // check to see if block is in bounds or not
+                        ) {
+                            neighbor = blocks[id + offsets[dir] * lod].tile;
+                        } else {
+                            ChunkPrimitive* neighbor_chunk = neighbors[dir];
+                            if (neighbor_chunk) {
+                                neighbor = neighbor_chunk->blocks[get_block_id(nx & CHUNK_SIZE_M1, ny & CHUNK_SIZE_M1, nz & CHUNK_SIZE_M1)].tile;
+                            }
+                        }
+                    } else {
+                        neighbor = blocks[id + offsets[dir] * lod].tile;
                     }
+                    bool is_solid_neighbor = neighbor != 0 && !transparent[neighbor];
+                    bool draw = (solid && !is_solid_neighbor) || (!solid && neighbor == 0);
+                    mask |= draw << dir;
                 }
-                chunk->blocks[get_block_id(x, y, z)].mask = mask;
+                blocks[id].mask = mask;
             }
         }
     }
     chunk->last_computed_lod_mask = lod;
 }
 
+// meshing untouched... FOR NOW
+// *dun dun DUN*
 __declspec(dllexport)
 void generate_mesh(
     ChunkPrimitive* chunk,
