@@ -142,7 +142,7 @@ function World:lovrUpdateAll()
     for _, func in pairs(World.lovrUpdate) do
         local timer = lovr.timer.getTime()
         local empty = false
-        while not empty and lovr.timer.getTime() - timer < 0.016 do
+        while not empty and lovr.timer.getTime() - timer < 0.01 do -- frame budget
             empty = func(self)
         end
     end

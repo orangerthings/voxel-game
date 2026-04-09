@@ -41,14 +41,8 @@ function Chunk:new(cx, cy, cz)
 end
 
 function Chunk:delete()
-    if self.mesh then
-        self.mesh:release()
-        self.mesh = nil
-    end
-    if self.blob then
-        self.blob:release()
-        self.blob = nil
-    end
+    self.mesh = nil
+    self.blob = nil
     self.blocks = nil
 end
 

@@ -6,7 +6,7 @@ require('load')
 local World = require('classes.world')
 local world = World()
 
-local renderDistance = 16
+local renderDistance = 32
 local rd2 = renderDistance * renderDistance
 
 local testlod = 1
@@ -31,7 +31,7 @@ function lovr.update(dt)
 
         -- load/update chunks within render distance
         for lx = cx - renderDistance, cx + renderDistance do
-            for ly = -2, 1 do
+            for ly = -1, 1 do
                 for lz = cz - renderDistance, cz + renderDistance do
                     local dx, dy, dz = lx - cx, ly - cy, lz - cz
                     if dx * dx + dy * dy + dz * dz <= rd2 then
@@ -52,6 +52,14 @@ end
 function lovr.keyreleased(key)
     if key == "g" then
         Debug.printAverages()
+        lovr.thread.getChannel("chunks_worker_debug_in"):push({type = 1000, payload = nil})
+        local m = lovr.thread.getChannel("chunks_worker_debug_out"):pop(true)
+        if m and m.type == 1000 then
+            local stats = m.payload
+            for t, stat in pairs(stats) do
+                print(string.format("Average time taken for debug code %s: %.6f seconds", tostring(t), stat.sum / stat.count))
+            end
+        end
     end
 end
 

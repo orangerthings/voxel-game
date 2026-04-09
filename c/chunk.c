@@ -1,3 +1,32 @@
+#include <signal.h>
+#include <stdio.h>
+#include <time.h>
+
+#include <windows.h>
+static LONG WINAPI crash_handler(EXCEPTION_POINTERS* info) {
+    FILE* f = fopen("crash.log", "a");
+    if (f) {
+        time_t t = time(NULL);
+        fprintf(f, "=== CRASH %s", ctime(&t));
+        fprintf(f, "Exception code: 0x%08lX\n", info->ExceptionRecord->ExceptionCode);
+        fprintf(f, "Exception addr: 0x%p\n", info->ExceptionRecord->ExceptionAddress);
+        // print exception-specific info
+        if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+            ULONG_PTR* info_arr = info->ExceptionRecord->ExceptionInformation;
+            fprintf(f, "Access violation: %s address 0x%p\n",
+                info_arr[0] == 0 ? "READ" : "WRITE",
+                (void*)info_arr[1]);
+        }
+        fclose(f);
+    }
+    return EXCEPTION_CONTINUE_SEARCH; // let the OS handle it after logging
+}
+
+__declspec(dllexport)
+void init_crash_handler(void) {
+    AddVectoredExceptionHandler(1, crash_handler); // 1 = call first
+}
+
 // because the fastest way to do anything in lua is to write it in C!
 #include <stdint.h>
 #include <stdlib.h>
@@ -79,13 +108,29 @@ static void resize(ChunkSpace* map) {
 }
 
 __declspec(dllexport)
-void init_chunk(ChunkPrimitive* chunk, position pos, uint8_t lod, block* blocks) {
+block* allocate_blocks() {
+    return (block*)malloc(sizeof(block) * CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE);
+}
+
+__declspec(dllexport)
+void copy_blocks(block* dst, block* src) {
+    memcpy(dst, src, sizeof(block) * CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE);
+}
+
+static void init_chunk(ChunkPrimitive* chunk, position pos, uint8_t lod) {
     chunk->pos = pos;
     chunk->chunkSize = CHUNK_SIZE;
     chunk->lod = lod;
     chunk->last_computed_lod_mask = 0;
     chunk->neighbors = 0;
-    chunk->blocks = blocks;
+    chunk->blocks = allocate_blocks();
+}
+
+__declspec(dllexport)
+ChunkPrimitive* new_chunk(position pos, uint8_t lod) {
+    ChunkPrimitive* chunk = malloc(sizeof(ChunkPrimitive));
+    init_chunk(chunk, pos, lod);
+    return chunk;
 }
 
 const int NORMALS[6][4] = {
@@ -198,6 +243,10 @@ void remove_chunk(ChunkSpace* space, position pos) {
             } else {
                 previous->next = current->next;
             }
+            if (current->chunk) {
+                free(current->chunk->blocks);
+                free(current->chunk);
+            }
             free(current);
             space->count--;
             break;
@@ -213,6 +262,10 @@ void free_space(ChunkSpace* space) {
         ChunkEntry* current = space->buckets[i];
         while (current) {
             ChunkEntry* next = current->next;
+            if (current->chunk) {
+                free(current->chunk->blocks);
+                free(current->chunk);
+            }
             free(current);
             current = next;
         }
@@ -225,13 +278,57 @@ static inline uint16_t get_block_id(int8_t x, int8_t y, int8_t z) {
     return ((uint16_t)x<<LOG2_CHUNK_SIZE*2) | (y<<LOG2_CHUNK_SIZE) | z;
 }
 
+// for offsetting an id quickly without having to use a special function
+const int STRIDES[6] = {
+    -(1 << (LOG2_CHUNK_SIZE * 2)),  // -x
+    -(1 << LOG2_CHUNK_SIZE),        // -y
+    -1,                             // -z
+    1 << (LOG2_CHUNK_SIZE * 2),     // +x
+    1 << LOG2_CHUNK_SIZE,           // +y
+    1                               // +z
+};
+
+// creating duh terrains
+
+#define FNL_IMPL
+#include "FastNoiseLite.h"
+__declspec(dllexport)
+void generate_chunk(ChunkSpace* space, ChunkPrimitive* chunk) {
+    fnl_state noise = fnlCreateState();
+    noise.seed = 1337;
+    noise.noise_type = FNL_NOISE_OPENSIMPLEX2;
+    noise.frequency = 1.0f / 64.0f;
+
+    uint8_t lod = chunk->lod;
+    block* blocks = chunk->blocks;
+    for (int x = 0; x < CHUNK_SIZE; x += lod) {
+        for (int z = 0; z < CHUNK_SIZE; z += lod) {
+            float height = fnlGetNoise2D(&noise, (float)(x+chunk->pos.x*CHUNK_SIZE), (float)(z+chunk->pos.z*CHUNK_SIZE)) * 4.0f + 4.0f;
+            for (int y = 0; y < CHUNK_SIZE; y += lod) {
+                int tile = 0;
+                int wy = y+chunk->pos.y*CHUNK_SIZE;
+                if (wy <= height) {
+                    if (wy < 3) {
+                        tile = 2;
+                    } else if (wy < 6) {
+                        tile = 1;
+                    } else {
+                        tile = 3;
+                    }
+                }
+                blocks[get_block_id(x,y,z)].tile = tile;
+            }
+        }
+    }
+}
+
+// meshing
+
 const block AIR = {
     .tile = 0,
     .state = 0,
     .mask = 0
 };
-
-// meshing
 
 // faces and normal directions
 const float QUADS[6][4][5] = {
@@ -241,16 +338,6 @@ const float QUADS[6][4][5] = {
     {{1,0,1,0,1},{1,0,0,1,1},{1,1,0,1,0},{1,1,1,0,0}},
     {{0,1,1,0,1},{1,1,1,1,1},{1,1,0,1,0},{0,1,0,0,0}},
     {{0,0,1,0,1},{1,0,1,1,1},{1,1,1,1,0},{0,1,1,0,0}}
-};
-
-// for offsetting an id quickly without having to use a special function
-const int offsets[6] = {
-    -(1 << (LOG2_CHUNK_SIZE * 2)),  // -x
-    -(1 << LOG2_CHUNK_SIZE),        // -y
-    -1,                             // -z
-    1 << (LOG2_CHUNK_SIZE * 2),     // +x
-    1 << LOG2_CHUNK_SIZE,           // +y
-    1                               // +z
 };
 
 __declspec(dllexport)
@@ -301,7 +388,7 @@ void compute_mask(
                             ny >= 0 && ny < CHUNK_SIZE &&
                             nz >= 0 && nz < CHUNK_SIZE // check to see if block is in bounds or not
                         ) {
-                            neighbor = blocks[id + offsets[dir] * lod].tile;
+                            neighbor = blocks[id + STRIDES[dir] * lod].tile;
                         } else {
                             ChunkPrimitive* neighbor_chunk = neighbors[dir];
                             if (neighbor_chunk) {
@@ -309,7 +396,7 @@ void compute_mask(
                             }
                         }
                     } else {
-                        neighbor = blocks[id + offsets[dir] * lod].tile;
+                        neighbor = blocks[id + STRIDES[dir] * lod].tile;
                     }
                     bool is_solid_neighbor = neighbor != 0 && !transparent[neighbor];
                     bool draw = (solid && !is_solid_neighbor) || (!solid && neighbor == 0);

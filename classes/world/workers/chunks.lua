@@ -49,12 +49,19 @@ ffi.cdef(string.format([[
         size_t count;
     } ChunkSpace;
 
+    void init_crash_handler(void);
+
     void init_space(ChunkSpace* space);
-    void init_chunk(ChunkPrimitive* chunk, position pos, uint8_t lod, block* blocks);
+    block* alloc_blocks();
+    void copy_blocks(block* dst, block* src);
+
+    ChunkPrimitive* new_chunk(position pos, uint8_t lod);
     ChunkPrimitive* get_chunk(ChunkSpace* space, position pos, bool* found);
     void add_chunk(ChunkSpace* space, ChunkPrimitive* chunk);
     void remove_chunk(ChunkSpace* space, position pos);
     void free_space(ChunkSpace* space);
+
+    void generate_chunk(ChunkSpace* space, ChunkPrimitive* chunk);
 
     void compute_mask(ChunkPrimitive* chunk, ChunkSpace* space, bool* transparent);
     void generate_mesh(
@@ -69,13 +76,10 @@ ffi.cdef(string.format([[
 ]], chunkSize * chunkSize, chunkSize * chunkSize))
 
 local C = ffi.load(lovr.filesystem.getSource().."/c/chunk")
+C.init_crash_handler()
 
 local CSpace = ffi.new("ChunkSpace")
 C.init_space(CSpace)
-
--- stuff to sync chunks on the main thread and worker thread
--- table of references so that the gc doesnt behead the ffi objects while they are still in use by the worker thread
-local references = {}
 
 local C_found = ffi.new("bool[1]") -- reuse
 
@@ -91,15 +95,24 @@ local function C_get_chunk(cx, cy, cz)
     end
 end
 
+local function C_set_blocks(chunk, blocks)
+    C.copy_blocks(chunk.blocks, blocks)
+end
+
 local function C_new_chunk(cx, cy, cz, lod, blocks)
     local pos = ffi.new("position", cx, cy, cz)
-    local chunk = ffi.new("ChunkPrimitive")
-    C.init_chunk(chunk, pos, lod, blocks)
+    local chunk = C.new_chunk(pos, lod)
+    if blocks then
+        C_set_blocks(chunk, blocks)
+    end
     return chunk
 end
 
+local function C_generate_chunk(chunk)
+    C.generate_chunk(CSpace, chunk)
+end
+
 local function C_add_chunk(chunk)
-    references[chunk.pos.x..","..chunk.pos.y..","..chunk.pos.z] = chunk
     C.add_chunk(CSpace, chunk)
 end
 
@@ -108,7 +121,6 @@ local function C_remove_chunk(cx, cy, cz)
     C.get_chunk(CSpace, pos, C_found)
     if C_found[0] then
         C.remove_chunk(CSpace, pos)
-        references[cx..","..cy..","..cz] = nil  -- release GC reference
         C_found[0] = false
     end
 end
@@ -158,68 +170,33 @@ local function buildMesh(chunk)
     return vertices, indices
 end
 
--- generate blob and blocks
-local function generate(cx, cy, cz)
-    local blob = lovr.data.newBlob(ffi.sizeof("block") * (chunkSize ^ 3), "byteData")
-    local blocks = ffi.cast("block*", blob:getPointer())
-    local noise = lovr.math.noise
-    local mult = 1/16
-    local base = cx * 32
-    local basey = cy * 32
-    local basez = cz * 32
-    for x = 1, chunkSize do
-        local wx_base = x + base
-        local x0 = x - 1
-        for y = 1, chunkSize do
-            local wy = y + basey
-            local y0 = y - 1
-            for z = 1, chunkSize do
-                local wz = z + basez
-                local height = noise(wx_base * mult, wz * mult) * 8
-                local tile
-                if wy <= height then
-                    if wy < 3 then
-                        tile = 2
-                    elseif wy < 6 then
-                        tile = 1
-                    else
-                        tile = 3
-                    end
-                else
-                    tile = 0
-                end
-                local z0 = z - 1
-                local id = x0 * chunkSize * chunkSize + y0 * chunkSize + z0
-                blocks[id].tile = tile
-            end
-        end
-    end
-    return blob, blocks
-end
-
 local channel_worker_in = lovr.thread.getChannel("chunks_worker_in")
 local channel_worker_out = lovr.thread.getChannel("chunks_worker_out")
 while true do
-    local message = channel_worker_in:pop(true)
+    local message = channel_worker_in:pop()
     if message then
         local t, payload = message.type, message.payload
         local k = "Worker thread overhead processing Chunk("..payload.cx..", "..payload.cy..", "..payload.cz..") (code: "..t..")"
-        Debug.timerStart(k, 100 + t)
+        local debug_code = t + 100
+        Debug.timerStart(k, debug_code)
         -- -1: delete
         if t == -1 then
             C_remove_chunk(payload.cx, payload.cy, payload.cz)
-        -- 0: update
+        -- 0: update/create if not exist
         elseif t == 0 then
             local chunk = C_get_chunk(payload.cx, payload.cy, payload.cz)
             if chunk then
-                chunk.blocks = ffi.cast("block*", payload.blob:getPointer())
+                C_set_blocks(chunk, ffi.cast("block*", payload.blob:getPointer()))
             else
                 C_add_chunk(C_new_chunk(payload.cx, payload.cy, payload.cz, payload.lod, ffi.cast("block*", payload.blob:getPointer())))
             end
         -- 1: create
         elseif t == 1 then
-            local blob, blocks = generate(payload.cx, payload.cy, payload.cz)
-            C_add_chunk(C_new_chunk(payload.cx, payload.cy, payload.cz, payload.lod, blocks))
+            local chunk = C_new_chunk(payload.cx, payload.cy, payload.cz, payload.lod)
+            C_generate_chunk(chunk)
+            C_add_chunk(chunk)
+            local blob = lovr.data.newBlob(chunkSize * chunkSize * chunkSize * ffi.sizeof("block"))
+            ffi.copy(blob:getPointer(), chunk.blocks, chunkSize * chunkSize * chunkSize * ffi.sizeof("block"))
             channel_worker_out:push({type = 1, payload = {
                 cx = payload.cx, cy = payload.cy, cz = payload.cz,
                 blob = blob
@@ -243,9 +220,11 @@ while true do
             end
         -- 3: create and mesh
         elseif t == 3 then
-            local blob, blocks = generate(payload.cx, payload.cy, payload.cz)
-            local chunk = C_new_chunk(payload.cx, payload.cy, payload.cz, payload.lod, blocks)
+            local chunk = C_new_chunk(payload.cx, payload.cy, payload.cz, payload.lod)
+            C_generate_chunk(chunk)
             C_add_chunk(chunk)
+            local blob = lovr.data.newBlob(chunkSize * chunkSize * chunkSize * ffi.sizeof("block"))
+            ffi.copy(blob:getPointer(), chunk.blocks, chunkSize * chunkSize * chunkSize * ffi.sizeof("block"))
             local vertices, indices = buildMesh(chunk)
             if vertices then
                 channel_worker_out:push({type = 3, payload = {
@@ -262,6 +241,9 @@ while true do
             end
         end
         Debug.timerStop(k)
-        Debug.printAverages()
+    end
+    local debug_request = lovr.thread.getChannel("chunks_worker_debug_in"):pop()
+    if debug_request and debug_request.type == 1000 then
+        lovr.thread.getChannel("chunks_worker_debug_out"):push({type = 1000, payload = Debug.stats})
     end
 end
