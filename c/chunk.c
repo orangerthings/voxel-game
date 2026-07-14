@@ -48,6 +48,11 @@ typedef struct {
     int x, y, z;
 } position;
 
+typedef struct {
+    uint16_t tile;
+    uint16_t mask;
+} meshing_buffer_unit;
+
 typedef struct ChunkPrimitive {
     position pos;
     uint8_t chunkSize;
@@ -56,8 +61,10 @@ typedef struct ChunkPrimitive {
     uint8_t neighbors;
 
     uint8_t last_computed_lod_mask;
-    bool mask_buffer[CHUNK_SIZE * CHUNK_SIZE];
-    uint16_t tile_buffer[CHUNK_SIZE * CHUNK_SIZE];
+    // BUFFERS ARE ARRAYS OF 64-BIT INTEGERS INSTEAD OF 32-BIT TO AVOID UNDEFINED BEHAVIOR WITH __builtin_ctz(0)
+    uint64_t meshing_buffer[CHUNK_SIZE]; // array of bitfields to encode all v values into one binary number
+    uint64_t prefix_buffer[CHUNK_SIZE]; // bitfield to encode whether or not tile v at a given position is equivalent to v-1
+    uint16_t tile_buffer[CHUNK_SIZE][CHUNK_SIZE];
 } ChunkPrimitive;
 
 typedef struct ChunkEntry {
@@ -288,35 +295,66 @@ const int STRIDES[6] = {
     1                               // +z
 };
 
+const int CUTS[6] = {
+    CHUNK_SIZE_M1 << LOG2_CHUNK_SIZE * 2, // x
+    CHUNK_SIZE_M1 << LOG2_CHUNK_SIZE,     // y
+    CHUNK_SIZE_M1,                        // z
+    CHUNK_SIZE_M1 << LOG2_CHUNK_SIZE * 2, // x
+    CHUNK_SIZE_M1 << LOG2_CHUNK_SIZE,     // y
+    CHUNK_SIZE_M1                         // z
+};
+
 // creating duh terrains
 
 #define FNL_IMPL
 #include "FastNoiseLite.h"
 __declspec(dllexport)
 void generate_chunk(ChunkSpace* space, ChunkPrimitive* chunk) {
-    fnl_state noise = fnlCreateState();
-    noise.seed = 1337;
-    noise.noise_type = FNL_NOISE_OPENSIMPLEX2;
-    noise.frequency = 1.0f / 64.0f;
+    static fnl_state noise;
+    static int noise_init = 0;
+    if (!noise_init) {
+        noise = fnlCreateState();
+        noise.seed = 1337;
+        noise.noise_type = FNL_NOISE_OPENSIMPLEX2;
+        noise.frequency = 1.0f / 64.0f;
+        noise_init = 1;
+    }
 
     uint8_t lod = chunk->lod;
     block* blocks = chunk->blocks;
-    for (int x = 0; x < CHUNK_SIZE; x += lod) {
+    int base_x = chunk->pos.x * CHUNK_SIZE;
+    int base_y = chunk->pos.y * CHUNK_SIZE;
+    int base_z = chunk->pos.z * CHUNK_SIZE;
+
+    if (base_y > 8) {
+        memset(blocks, 0, sizeof(block) * CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE);
+        return;
+    }
+
+    float heights[CHUNK_SIZE][CHUNK_SIZE];
+    int x;
+    #pragma omp parallel for schedule(static) firstprivate(noise)
+    for (x = 0; x < CHUNK_SIZE; x += lod) {
         for (int z = 0; z < CHUNK_SIZE; z += lod) {
-            float height = fnlGetNoise2D(&noise, (float)(x+chunk->pos.x*CHUNK_SIZE), (float)(z+chunk->pos.z*CHUNK_SIZE)) * 4.0f + 4.0f;
+            heights[x][z] = fnlGetNoise2D(&noise,
+                (float)(x + base_x),
+                (float)(z + base_z)) * 4.0f + 4.0f;
+        }
+    }
+
+    uint8_t solid_tile[CHUNK_SIZE];
+    for (int y = 0; y < CHUNK_SIZE; y += lod) {
+        int wy = y + base_y;
+        solid_tile[y] = (wy < 3) ? 2 : (wy < 6) ? 1 : 3;
+    }
+
+    #pragma omp parallel for schedule(static)
+    for (x = 0; x < CHUNK_SIZE; x += lod) {
+        for (int z = 0; z < CHUNK_SIZE; z += lod) {
+            float height = heights[x][z];
             for (int y = 0; y < CHUNK_SIZE; y += lod) {
-                int tile = 0;
-                int wy = y+chunk->pos.y*CHUNK_SIZE;
-                if (wy <= height) {
-                    if (wy < 3) {
-                        tile = 2;
-                    } else if (wy < 6) {
-                        tile = 1;
-                    } else {
-                        tile = 3;
-                    }
-                }
-                blocks[get_block_id(x,y,z)].tile = tile;
+                int wy = y + base_y;
+                blocks[get_block_id(x,y,z)].tile = (wy <= height) ? solid_tile[y] : 0;
             }
         }
     }
@@ -340,6 +378,21 @@ const float QUADS[6][4][5] = {
     {{0,0,1,0,1},{1,0,1,1,1},{1,1,1,1,0},{0,1,1,0,0}}
 };
 
+// strides but specialized for generate_mesh
+const int DIR_SHIFT[8] = {
+    LOG2_CHUNK_SIZE * 2,     // x
+    LOG2_CHUNK_SIZE,         // y
+    0,                       // z
+    LOG2_CHUNK_SIZE * 2,     // x
+    LOG2_CHUNK_SIZE,         // y
+    0,                       // z
+    LOG2_CHUNK_SIZE * 2,     // x
+    LOG2_CHUNK_SIZE,         // y
+};
+
+const int MOD_3[8] = {0,1,2,0,1,2,0,1};
+const int INV_MOD_3[6] = {0,2,1,0,2,1};
+
 __declspec(dllexport)
 void compute_mask(
     ChunkPrimitive* chunk,
@@ -362,55 +415,37 @@ void compute_mask(
 
     uint8_t lod = chunk->lod;
     block* blocks = chunk->blocks;
-    for (int x = 0; x < CHUNK_SIZE; x += lod) {
-        for (int y = 0; y < CHUNK_SIZE; y += lod) {
-            for (int z = 0; z < CHUNK_SIZE; z += lod) {
-                int id = (x << (LOG2_CHUNK_SIZE*2)) | (y << LOG2_CHUNK_SIZE) | z;
-                uint16_t tile = blocks[id].tile;
-                if (tile == 0) {
-                    blocks[id].mask = 0;
-                    continue;
-                }
-                uint8_t mask = 0;
-                bool solid = !transparent[tile];
-                for (int dir = 0; dir < 6; dir++) {
-                    uint16_t neighbor = 0;
-                    if (
-                        x < lod || x >= CHUNK_SIZE-lod ||
-                        y < lod || y >= CHUNK_SIZE-lod ||
-                        z < lod || z >= CHUNK_SIZE-lod // check to see if on border or not
-                    ) {
-                        int nx = x + NORMALS[dir][0]*lod;
-                        int ny = y + NORMALS[dir][1]*lod;
-                        int nz = z + NORMALS[dir][2]*lod;
-                        if (
-                            nx >= 0 && nx < CHUNK_SIZE &&
-                            ny >= 0 && ny < CHUNK_SIZE &&
-                            nz >= 0 && nz < CHUNK_SIZE // check to see if block is in bounds or not
-                        ) {
-                            neighbor = blocks[id + STRIDES[dir] * lod].tile;
-                        } else {
-                            ChunkPrimitive* neighbor_chunk = neighbors[dir];
-                            if (neighbor_chunk) {
-                                neighbor = neighbor_chunk->blocks[get_block_id(nx & CHUNK_SIZE_M1, ny & CHUNK_SIZE_M1, nz & CHUNK_SIZE_M1)].tile;
-                            }
-                        }
-                    } else {
-                        neighbor = blocks[id + STRIDES[dir] * lod].tile;
-                    }
-                    bool is_solid_neighbor = neighbor != 0 && !transparent[neighbor];
-                    bool draw = (solid && !is_solid_neighbor) || (!solid && neighbor == 0);
-                    mask |= draw << dir;
-                }
-                blocks[id].mask = mask;
-            }
+    for (int id = 0; id < CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE; id++) {
+        uint16_t tile = blocks[id].tile;
+        if (tile == 0) {
+            blocks[id].mask = 0;
+            continue;
         }
+        uint8_t mask = 0;
+        bool solid = !transparent[tile];
+        for (int dir = 0; dir < 6; dir++) {
+            uint16_t neighbor = 0;
+            int CUT = CUTS[dir];
+            int nid = id + STRIDES[dir];
+            int id_odid = id & ~CUT;
+            if (id_odid == (nid & ~CUT)) { // out of bounds logic
+                neighbor = blocks[nid].tile;
+            } else {
+                ChunkPrimitive* neighbor_chunk = neighbors[dir];
+                if (neighbor_chunk) {
+                    neighbor = neighbor_chunk->blocks[id_odid | (nid & CUT)].tile;
+                }
+            }
+            bool is_solid_neighbor = neighbor != 0 && !transparent[neighbor];
+            bool draw = (solid && !is_solid_neighbor) || (!solid && neighbor == 0);
+            mask |= draw << dir;
+        }
+        blocks[id].mask = mask;
     }
     chunk->last_computed_lod_mask = lod;
 }
 
-// meshing untouched... FOR NOW
-// *dun dun DUN*
+// meshing
 __declspec(dllexport)
 void generate_mesh(
     ChunkPrimitive* chunk,
@@ -427,116 +462,90 @@ void generate_mesh(
     if (chunk->last_computed_lod_mask != chunk->lod) {
         compute_mask(chunk, space, transparent);
     }
+    block* blocks = chunk->blocks;
 
-    int vertex_count = 0;
+    uint64_t* meshing_buffer = chunk->meshing_buffer;
+    uint64_t* prefix_buffer = chunk->prefix_buffer;
+    uint16_t (*tiles)[CHUNK_SIZE] = chunk->tile_buffer;
+    int vertex_count = 1;
     int index_count = 0;
     int quad_count = 0;
-
-    bool* masks = chunk->mask_buffer;
-    uint16_t* tiles = chunk->tile_buffer;
-    vertex_count = 1;
-    index_count = 0;
-    quad_count = 0;
-    // then start the real loops
+    
     for (int dir = 0; dir < 6; dir++) {
-        int nx = NORMALS[dir][0] * lod;
-        int ny = NORMALS[dir][1] * lod;
-        int nz = NORMALS[dir][2] * lod;
-        int ndix = NORMALS[dir][3];
-
-        for (int slice = 1; slice <= lod_size; slice++) {
-            for (int u = 1; u <= lod_size; u++) {
-                for (int v = 1; v <= lod_size; v++) {
-                    int x,y,z;
-                    if (ndix == 1) {
-                        x = (slice-1) * lod;
-                        y = (u-1) * lod;
-                        z = (v-1) * lod;
-                    } else if (ndix == 2) {
-                        x = (u-1) * lod;
-                        y = (slice-1) * lod;
-                        z = (v-1) * lod;
-                    } else {
-                        x = (u-1) * lod;
-                        y = (v-1) * lod;
-                        z = (slice-1) * lod;
+        for (int slice = 0; slice < CHUNK_SIZE; slice++) {
+            memset(meshing_buffer, 0, CHUNK_SIZE * sizeof(uint64_t));
+            memset(prefix_buffer, 0, CHUNK_SIZE * sizeof(uint64_t));
+            for (int u = 0; u < CHUNK_SIZE; u++) {
+                int b_id = (slice << DIR_SHIFT[dir]) | (u << DIR_SHIFT[dir+1]);
+                for (int v = 0; v < CHUNK_SIZE; v++) {
+                    block b = blocks[b_id];
+                    uint16_t tile = b.tile;
+                    if ((b.mask >> dir) & 1) {
+                        meshing_buffer[u] |= (1ULL << v);
                     }
-                    block b = (chunk->blocks)[get_block_id(x,y,z)];
-                    masks[(u-1)*lod_size + (v-1)] = (b.mask >> dir) & 1;
-                    tiles[(u-1)*lod_size + (v-1)] = b.tile;
+                    b_id += (1 << DIR_SHIFT[dir+2]);
+                    if (v < CHUNK_SIZE-1) {
+                        if (tile == blocks[b_id].tile) {
+                            prefix_buffer[u] |= (1ULL << (v+1));
+                        }
+                    }
+                    tiles[u][v] = tile;
                 }
             }
+            for (int u = 0; u < CHUNK_SIZE; u++) {
+                uint64_t v_col = meshing_buffer[u];
+                while (v_col != 0) {
+                    int v = __builtin_ctz(v_col); // get position lowest draw of the column
+                    uint16_t tile = tiles[u][v];
 
-            for (int u = 0; u < lod_size; u++) {
-                for (int v = 0; v < lod_size; v++) {
-                    uint16_t tile = tiles[u*lod_size + v];
-                    bool mask = masks[u*lod_size + v];
-                    if (mask == 0) continue;
+                    // h expands v-wise
+                    uint64_t shifted = v_col >> v;
+                    int h_vsbl = __builtin_ctz(shifted+1); // counts how many down the line are visible
+                    int h_same = __builtin_ctz((prefix_buffer[u]>>(v+1))+1)+1; // counts how many down the line are same
+                    int h = (h_vsbl < h_same) ? h_vsbl : h_same; // their min is the true height
 
+                    // w expands u-wise
+                    uint64_t height_cut = ((1ULL << h) - 1) << v; // bits from v to v+h-1 to check colums later
+                    uint64_t prefix_height_cut = ((1ULL << h) - 1) << (v+1); // bits from v+1 to v+h-1 to check the prefixes later
                     int w = 1;
-                    while (
-                        u+w < lod_size &&
-                        tiles[(u+w)*lod_size + v] == tile && 
-                        masks[(u+w)*lod_size + v] == 1
-                    ) {
+                    while (u + w < CHUNK_SIZE) {
+                        // is the next column entirely visible?
+                        if ((meshing_buffer[u + w] & height_cut) != height_cut) {
+                            break;
+                        }
+                        // is the next column entirely the same?
+                        if ((prefix_buffer[u + w] & prefix_height_cut) != prefix_height_cut) {
+                            break;
+                        }
+                        // is the next column the same tile?
+                        if (tile != tiles[u + w][v]) {
+                            break;
+                        }
+                        // we have succeeded if so!!
                         w++;
                     }
-                    int h = 1;
-                    int expand = 1;
-                    while (v+h < lod_size && expand) {
-                        for (int dx = 0; dx < w; dx++) {
-                            if (
-                                tiles[(u+dx)*lod_size + (v+h)] != tile || 
-                                masks[(u+dx)*lod_size + (v+h)] == 0
-                            ) {
-                                expand = 0;
-                                break;
-                            }
-                        }
-                        if (expand) h++;
-                    }
-                    for (int du = 0; du < w; du++) {
-                        for (int dv = 0; dv < h; dv++) {
-                            tiles[(u+du)*lod_size + (v+dv)] = 0;
-                            masks[(u+du)*lod_size + (v+dv)] = 0;
-                        }
-                    }
 
-                    int px,py,pz;
-                    if (ndix == 1) { 
-                        px=slice; 
-                        py=u+1; 
-                        pz=v+1; 
-                    } else if (ndix == 2) { 
-                        px=u+1; 
-                        py=slice; 
-                        pz=v+1; 
-                    } else { 
-                        px=u+1; 
-                        py=v+1; 
-                        pz=slice; 
+                    // remove the bits for this quad
+                    uint64_t prefix_eraser_cut = ((1ULL << h) - 1) << (v+1); // bits from v to v+h to erase prefixes
+                    for (int du = 0; du < w; du++) {
+                        meshing_buffer[u + du] &= ~height_cut;
+                        prefix_buffer[u + du] &= ~prefix_eraser_cut;
                     }
-                    int dx,dy,dz;
-                    if (ndix == 1) { 
-                        dx=1; 
-                        dy=w; 
-                        dz=h; 
-                    } else if (ndix == 2) { 
-                        dx=w; 
-                        dy=1; 
-                        dz=h; 
-                    } else {
-                        dx=w; 
-                        dy=h; 
-                        dz=1; 
-                    }
+                    v_col = meshing_buffer[u];
+
+                    // emit quad
+                    int rx = INV_MOD_3[dir],ry=MOD_3[rx+1],rz=MOD_3[rx+2];
+                    int p[3] = {slice,u,v}; // extracts u,v from uv_id
+                    int px=p[rx],py=p[ry],pz=p[rz];
+                    int d[3] = {1,w,h}; // dimensions
+                    int dx=d[rx],dy=d[ry],dz=d[rz];
                     for (int i = 0; i < 4; i++) {
                         int b = vertex_count * 6;
                         vertex_buffer[b+0] = (QUADS[dir][i][0]*dx + (px-1)) * lod;
                         vertex_buffer[b+1] = (QUADS[dir][i][1]*dy + (py-1)) * lod;
                         vertex_buffer[b+2] = (QUADS[dir][i][2]*dz + (pz-1)) * lod;
-                        vertex_buffer[b+3] = QUADS[dir][i][3] * (ndix==1 ? h : w) * lod;
-                        vertex_buffer[b+4] = QUADS[dir][i][4] * (ndix==1 ? w : h) * lod;
+                        vertex_buffer[b+3] = QUADS[dir][i][3] * (dir==2||dir==5 ? w : h) * lod;
+                        vertex_buffer[b+4] = QUADS[dir][i][4] * (dir==2||dir==5 ? h : w) * lod;
                         vertex_buffer[b+5] = tile - 1;
                         vertex_count++;
                     }

@@ -53,13 +53,6 @@ function lovr.keyreleased(key)
     if key == "g" then
         Debug.printAverages()
         lovr.thread.getChannel("chunks_worker_debug_in"):push({type = 1000, payload = nil})
-        local m = lovr.thread.getChannel("chunks_worker_debug_out"):pop(true)
-        if m and m.type == 1000 then
-            local stats = m.payload
-            for t, stat in pairs(stats) do
-                print(string.format("Average time taken for debug code %s: %.6f seconds", tostring(t), stat.sum / stat.count))
-            end
-        end
     end
 end
 

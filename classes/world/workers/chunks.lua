@@ -29,6 +29,11 @@ ffi.cdef(string.format([[
         int x, y, z;
     } position;
 
+    typedef struct {
+        uint16_t tile;
+        uint16_t mask;
+    } meshing_buffer_unit;
+
     typedef struct ChunkPrimitive {
         position pos;
         uint8_t chunkSize;
@@ -37,8 +42,9 @@ ffi.cdef(string.format([[
         uint8_t neighbors;
 
         uint8_t last_computed_lod_mask;
-        bool mask_buffer[%d];
-        uint16_t tile_buffer[%d];
+        uint64_t meshing_buffer[%d];
+        uint64_t prefix_buffer[%d];
+        uint16_t tile_buffer[%d][%d];
     } ChunkPrimitive;
 
     typedef struct ChunkEntry ChunkEntry;
@@ -73,7 +79,7 @@ ffi.cdef(string.format([[
         int* vertex_num_out,
         int* index_num_out
     );
-]], chunkSize * chunkSize, chunkSize * chunkSize))
+]], chunkSize, chunkSize, chunkSize, chunkSize))
 
 local C = ffi.load(lovr.filesystem.getSource().."/c/chunk")
 C.init_crash_handler()
@@ -145,7 +151,7 @@ local indexCount  = ffi.new("int[1]")
 
 -- generate mesh vertices using greedy meshing
 local function buildMesh(chunk)
-    if chunk.neighbors ~= 6 then
+    if chunk.neighbors < 6 then
         return nil
     end
 
@@ -244,6 +250,6 @@ while true do
     end
     local debug_request = lovr.thread.getChannel("chunks_worker_debug_in"):pop()
     if debug_request and debug_request.type == 1000 then
-        lovr.thread.getChannel("chunks_worker_debug_out"):push({type = 1000, payload = Debug.stats})
+        Debug.printAverages()
     end
 end
