@@ -22,17 +22,11 @@ ffi.cdef(string.format([[
     typedef struct { 
         uint16_t tile;
         uint8_t state;
-        uint8_t mask;
     } block;
 
     typedef struct { 
         int x, y, z;
     } position;
-
-    typedef struct {
-        uint16_t tile;
-        uint16_t mask;
-    } meshing_buffer_unit;
 
     typedef struct ChunkPrimitive {
         position pos;
@@ -41,7 +35,6 @@ ffi.cdef(string.format([[
         block* blocks;
         uint8_t neighbors;
 
-        uint8_t last_computed_lod_mask;
         uint64_t meshing_buffer[%d];
         uint64_t prefix_buffer[%d];
         uint16_t tile_buffer[%d][%d];
@@ -69,7 +62,6 @@ ffi.cdef(string.format([[
 
     void generate_chunk(ChunkSpace* space, ChunkPrimitive* chunk);
 
-    void compute_mask(ChunkPrimitive* chunk, ChunkSpace* space, bool* transparent);
     void generate_mesh(
         ChunkPrimitive* chunk,
         ChunkSpace* space,

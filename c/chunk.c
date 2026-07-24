@@ -27,7 +27,6 @@ void init_crash_handler(void) {
     AddVectoredExceptionHandler(1, crash_handler); // 1 = call first
 }
 
-// because the fastest way to do anything in lua is to write it in C!
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,17 +40,11 @@ void init_crash_handler(void) {
 typedef struct { 
     uint16_t tile;
     uint8_t state;
-    uint8_t mask;
 } block;
 
 typedef struct { 
     int x, y, z;
 } position;
-
-typedef struct {
-    uint16_t tile;
-    uint16_t mask;
-} meshing_buffer_unit;
 
 typedef struct ChunkPrimitive {
     position pos;
@@ -60,7 +53,6 @@ typedef struct ChunkPrimitive {
     block* blocks;
     uint8_t neighbors;
 
-    uint8_t last_computed_lod_mask;
     // BUFFERS ARE ARRAYS OF 64-BIT INTEGERS INSTEAD OF 32-BIT TO AVOID UNDEFINED BEHAVIOR WITH __builtin_ctz(0)
     uint64_t meshing_buffer[CHUNK_SIZE]; // array of bitfields to encode all v values into one binary number
     uint64_t prefix_buffer[CHUNK_SIZE]; // bitfield to encode whether or not tile v at a given position is equivalent to v-1
@@ -128,7 +120,6 @@ static void init_chunk(ChunkPrimitive* chunk, position pos, uint8_t lod) {
     chunk->pos = pos;
     chunk->chunkSize = CHUNK_SIZE;
     chunk->lod = lod;
-    chunk->last_computed_lod_mask = 0;
     chunk->neighbors = 0;
     chunk->blocks = allocate_blocks();
 }
@@ -364,8 +355,7 @@ void generate_chunk(ChunkSpace* space, ChunkPrimitive* chunk) {
 
 const block AIR = {
     .tile = 0,
-    .state = 0,
-    .mask = 0
+    .state = 0
 };
 
 // faces and normal directions
@@ -393,58 +383,6 @@ const int DIR_SHIFT[8] = {
 const int MOD_3[8] = {0,1,2,0,1,2,0,1};
 const int INV_MOD_3[6] = {0,2,1,0,2,1};
 
-__declspec(dllexport)
-void compute_mask(
-    ChunkPrimitive* chunk,
-    ChunkSpace* space,
-    bool* transparent // transparency buffer
-) {
-    ChunkPrimitive* neighbors[6];
-    for (int dir = 0; dir < 6; dir++) {
-        position npos = {
-            chunk->pos.x + NORMALS[dir][0],
-            chunk->pos.y + NORMALS[dir][1],
-            chunk->pos.z + NORMALS[dir][2]
-        };
-        bool found;
-        neighbors[dir] = get_chunk(space, npos, &found);
-        if (!found) {
-            neighbors[dir] = NULL;
-        }
-    }
-
-    uint8_t lod = chunk->lod;
-    block* blocks = chunk->blocks;
-    for (int id = 0; id < CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE; id++) {
-        uint16_t tile = blocks[id].tile;
-        if (tile == 0) {
-            blocks[id].mask = 0;
-            continue;
-        }
-        uint8_t mask = 0;
-        bool solid = !transparent[tile];
-        for (int dir = 0; dir < 6; dir++) {
-            uint16_t neighbor = 0;
-            int CUT = CUTS[dir];
-            int nid = id + STRIDES[dir];
-            int id_odid = id & ~CUT;
-            if (id_odid == (nid & ~CUT)) { // out of bounds logic
-                neighbor = blocks[nid].tile;
-            } else {
-                ChunkPrimitive* neighbor_chunk = neighbors[dir];
-                if (neighbor_chunk) {
-                    neighbor = neighbor_chunk->blocks[id_odid | (nid & CUT)].tile;
-                }
-            }
-            bool is_solid_neighbor = neighbor != 0 && !transparent[neighbor];
-            bool draw = (solid && !is_solid_neighbor) || (!solid && neighbor == 0);
-            mask |= draw << dir;
-        }
-        blocks[id].mask = mask;
-    }
-    chunk->last_computed_lod_mask = lod;
-}
-
 // meshing
 __declspec(dllexport)
 void generate_mesh(
@@ -458,10 +396,7 @@ void generate_mesh(
 ) {
     uint8_t lod = chunk->lod;
     uint8_t lod_size = CHUNK_SIZE / lod;
-    
-    if (chunk->last_computed_lod_mask != chunk->lod) {
-        compute_mask(chunk, space, transparent);
-    }
+
     block* blocks = chunk->blocks;
 
     uint64_t* meshing_buffer = chunk->meshing_buffer;
@@ -470,7 +405,17 @@ void generate_mesh(
     int vertex_count = 1;
     int index_count = 0;
     int quad_count = 0;
-    
+    ChunkPrimitive* neighbors[6];
+    for (int dir = 0; dir < 6; dir++) {
+        position npos = {
+            chunk->pos.x + NORMALS[dir][0],
+            chunk->pos.y + NORMALS[dir][1],
+            chunk->pos.z + NORMALS[dir][2]
+        };
+        bool found;
+        neighbors[dir] = get_chunk(space, npos, &found);
+        if (!found) neighbors[dir] = NULL;
+    }
     for (int dir = 0; dir < 6; dir++) {
         for (int slice = 0; slice < CHUNK_SIZE; slice++) {
             memset(meshing_buffer, 0, CHUNK_SIZE * sizeof(uint64_t));
@@ -480,9 +425,30 @@ void generate_mesh(
                 for (int v = 0; v < CHUNK_SIZE; v++) {
                     block b = blocks[b_id];
                     uint16_t tile = b.tile;
-                    if ((b.mask >> dir) & 1) {
-                        meshing_buffer[u] |= (1ULL << v);
+
+                    // masking logic for meshing buffer
+                    if (tile != 0) {
+                        uint16_t neighbor = 0;
+                        int CUT = CUTS[dir];
+                        int nid = b_id + STRIDES[dir];
+                        int id_odid = b_id & ~CUT;
+                        if (id_odid == (nid & ~CUT)) { // oob?
+                            neighbor = blocks[nid].tile;
+                        } else {
+                            ChunkPrimitive* neighbor_chunk = neighbors[dir];
+                            if (neighbor_chunk) {
+                                neighbor = neighbor_chunk->blocks[id_odid | (nid & CUT)].tile;
+                            }
+                        }
+                        bool solid = !transparent[tile];
+                        bool is_solid_neighbor = neighbor != 0 && !transparent[neighbor];
+                        bool draw = (solid && !is_solid_neighbor) || (!solid && neighbor == 0);
+                        if (draw) {
+                            meshing_buffer[u] |= (1ULL << v);
+                        }
                     }
+
+                    // prefix buffer 
                     b_id += (1 << DIR_SHIFT[dir+2]);
                     if (v < CHUNK_SIZE-1) {
                         if (tile == blocks[b_id].tile) {
