@@ -42,15 +42,12 @@ ffi.cdef(string.format([[
 
     typedef struct ChunkEntry ChunkEntry;
 
-    typedef struct {
-        ChunkEntry** buckets;
-        size_t size;
-        size_t count;
-    } ChunkSpace;
-
     void init_crash_handler(void);
 
-    void init_space(ChunkSpace* space);
+    typedef struct {
+        // this literally doesnt need to have anything at all
+    } ChunkSpace;
+    
     block* alloc_blocks();
     void copy_blocks(block* dst, block* src);
 
@@ -76,8 +73,8 @@ ffi.cdef(string.format([[
 local C = ffi.load(lovr.filesystem.getSource().."/c/chunk")
 C.init_crash_handler()
 
-local CSpace = ffi.new("ChunkSpace")
-C.init_space(CSpace)
+local CSpace_pointer = ...
+local CSpace = ffi.cast("ChunkSpace*", ffi.cast("intptr_t", CSpace_pointer))
 
 local C_found = ffi.new("bool[1]") -- reuse
 

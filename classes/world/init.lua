@@ -4,16 +4,33 @@ World = ChunkSpace:extend("World")
 local Chunk = require('classes.chunk')
 local Debug = require("libraries.debug")
 
-local ffi = require("ffi")
-
 function World:new()
     -- the
     World.super.new(self)
 end
 
-local worker = lovr.thread.newThread("classes/world/workers/chunks.lua")
-worker:start()
+-- parallel threads for chunk loading  
+local ffi = require("ffi")
+ffi.cdef([[
+    typedef struct {
+        // this literally doesnt need to have anything at all
+    } ChunkSpace;
+    
+    ChunkSpace* init_space(void);
+]])
+local C = ffi.load(lovr.filesystem.getSource().."/c/chunk")
 
+local CSpace = C.init_space()
+local CSpace_pointer = tonumber(ffi.cast("intptr_t", CSpace))
+
+local NUM_WORKERS = 8 -- set to 4 if you have like 4 cores only or soemthing
+local workers = {}
+for i = 1, NUM_WORKERS do
+    local t = lovr.thread.newThread("classes/world/workers/chunks.lua")
+    t:start(CSpace_pointer)
+    table.insert(workers, t)
+end
+-- no need for multiple channels, the worker threads should all be able to process the data in parallel accordingly anyway
 local channel_in = lovr.thread.getChannel("chunks_worker_in")
 local channel_out = lovr.thread.getChannel("chunks_worker_out")
 

@@ -70,6 +70,7 @@ typedef struct {
     ChunkEntry** buckets;
     size_t size;
     size_t count;
+    CRITICAL_SECTION lock;
 } ChunkSpace;
 
 // hashmap methods
@@ -82,17 +83,21 @@ static inline int get_hash(position pos) {
 }
 
 __declspec(dllexport)
-void init_space(ChunkSpace* space) {
+ChunkSpace* init_space() {
+    ChunkSpace* space = malloc(sizeof(ChunkSpace));
     space->size = 1024;
     space->count = 0;
     space->buckets = calloc(space->size, sizeof(ChunkEntry*));
+    InitializeCriticalSection(&space->lock);
+    return space;
 }
 
-static void resize(ChunkSpace* map) {
-    size_t newSize = map->size*2;
+static void resize(ChunkSpace* space) {
+    EnterCriticalSection(&space->lock);
+    size_t newSize = space->size*2;
     ChunkEntry** newBuckets = calloc(newSize, sizeof(ChunkEntry*));
-    for (size_t i = 0; i < map->size; i++) {
-        ChunkEntry* current = map->buckets[i];
+    for (size_t i = 0; i < space->size; i++) {
+        ChunkEntry* current = space->buckets[i];
         while (current) {
             ChunkEntry* next = current->next;
             size_t index = (current->hash) & (newSize-1);
@@ -101,9 +106,10 @@ static void resize(ChunkSpace* map) {
             current = next;
         }
     }
-    free(map->buckets);
-    map->buckets = newBuckets;
-    map->size = newSize;
+    free(space->buckets);
+    space->buckets = newBuckets;
+    space->size = newSize;
+    LeaveCriticalSection(&space->lock);
 }
 
 __declspec(dllexport)
@@ -142,9 +148,9 @@ const int NORMALS[6][4] = {
 
 __declspec(dllexport)
 ChunkPrimitive* get_chunk(ChunkSpace* space, position pos, bool* found) {
+    EnterCriticalSection(&space->lock);
     int hash = get_hash(pos);
     size_t index = hash & (space->size-1);
-
     ChunkEntry* current = space->buckets[index];
     while (current) {
         if (
@@ -153,16 +159,19 @@ ChunkPrimitive* get_chunk(ChunkSpace* space, position pos, bool* found) {
             current->pos.z == pos.z
         ) {
             *found = true;
+            LeaveCriticalSection(&space->lock);
             return current->chunk;
         }
         current = current->next;
     }
     *found = false;
+    LeaveCriticalSection(&space->lock);
     return NULL;
 }
 
 __declspec(dllexport)
 void add_chunk(ChunkSpace* space, ChunkPrimitive* chunk) {
+    EnterCriticalSection(&space->lock);
     for (int dir = 0; dir < 6; dir++) {
         position neighbor_pos = {
             .x = chunk->pos.x+NORMALS[dir][0],
@@ -176,11 +185,9 @@ void add_chunk(ChunkSpace* space, ChunkPrimitive* chunk) {
             chunk->neighbors++;
         }
     }
-
     if ((double)space->count / space->size >= 0.5) {
         resize(space);
     }
-
     int hash = get_hash(chunk->pos);
     size_t index = hash & (space->size-1);
 
@@ -192,6 +199,7 @@ void add_chunk(ChunkSpace* space, ChunkPrimitive* chunk) {
             current->pos.z == chunk->pos.z
         ) {
             current->chunk = chunk;
+            LeaveCriticalSection(&space->lock);
             return;
         }
         current = current->next;
@@ -204,10 +212,12 @@ void add_chunk(ChunkSpace* space, ChunkPrimitive* chunk) {
     entry->next = space->buckets[index];
     space->buckets[index] = entry;
     space->count++;
+    LeaveCriticalSection(&space->lock);
 }
 
 __declspec(dllexport)
 void remove_chunk(ChunkSpace* space, position pos) {
+    EnterCriticalSection(&space->lock);
     for (int dir = 0; dir < 6; dir++) {
         position neighbor_pos = {
             .x = pos.x+NORMALS[dir][0],
@@ -222,13 +232,10 @@ void remove_chunk(ChunkSpace* space, position pos) {
             }
         }
     }
-
     int hash = get_hash(pos);
     size_t index = hash & (space->size-1);
-
     ChunkEntry* current = space->buckets[index];
     ChunkEntry* previous = NULL;
-
     while (current) {
         ChunkEntry* next = current->next;
         if (
@@ -252,8 +259,10 @@ void remove_chunk(ChunkSpace* space, position pos) {
         previous = current;
         current = next;
     }
+    LeaveCriticalSection(&space->lock);
 }
 
+// note for running: unused for now but unprotected so run with dicsretion
 __declspec(dllexport)
 void free_space(ChunkSpace* space) {
     for (size_t i = 0; i < space->size; i++) {
@@ -406,6 +415,8 @@ void generate_mesh(
     int index_count = 0;
     int quad_count = 0;
     ChunkPrimitive* neighbors[6];
+    // its important to lock this part 
+    EnterCriticalSection(&space->lock);
     for (int dir = 0; dir < 6; dir++) {
         position npos = {
             chunk->pos.x + NORMALS[dir][0],
@@ -416,6 +427,7 @@ void generate_mesh(
         neighbors[dir] = get_chunk(space, npos, &found);
         if (!found) neighbors[dir] = NULL;
     }
+    LeaveCriticalSection(&space->lock);
     for (int dir = 0; dir < 6; dir++) {
         for (int slice = 0; slice < CHUNK_SIZE; slice++) {
             memset(meshing_buffer, 0, CHUNK_SIZE * sizeof(uint64_t));
